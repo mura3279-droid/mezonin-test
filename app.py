@@ -1,219 +1,127 @@
-
-import os, json, sqlite3, hashlib, hmac, re, html
-from pathlib import Path
-from io import BytesIO
-import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
+import pandas as pd
+import re
+from urllib.parse import quote
 
-ROOT=Path(__file__).parent
-st.set_page_config(page_title="Мезонин · выкладка",page_icon="📦",layout="wide")
-st.markdown("""<style>.block-container{padding-top:1rem;max-width:1150px}.stButton button{border-radius:11px;min-height:42px}</style>""",unsafe_allow_html=True)
+st.set_page_config(page_title='Мезонин — выкладка', page_icon='📦', layout='centered', initial_sidebar_state='collapsed')
+st.markdown('''<style>
+.block-container{padding-top:1rem;padding-bottom:3rem;max-width:760px}h1{font-size:1.65rem!important}div[data-testid="stVerticalBlockBorderWrapper"]{border-radius:16px}div.stButton>button{min-height:48px;border-radius:12px}div[data-testid="stMetric"]{background:#f6f7f9;padding:10px;border-radius:12px}@media(max-width:600px){.block-container{padding-left:12px;padding-right:12px}div[data-testid="stHorizontalBlock"]{gap:7px}}
+</style>''', unsafe_allow_html=True)
 
-DB=ROOT/"mezonin_demo.sqlite3"
-def connect():
-    c=sqlite3.connect(str(DB),timeout=15)
-    c.execute("PRAGMA journal_mode=WAL")
-    c.execute("""CREATE TABLE IF NOT EXISTS products(
-      item_id TEXT PRIMARY KEY, sku TEXT, barcode TEXT, name TEXT, unit TEXT,
-      qty TEXT, grp TEXT, subgroup TEXT, brand TEXT, address TEXT,
-      alley TEXT, module TEXT, shelf TEXT)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS statuses(item_id TEXT PRIMARY KEY,status TEXT NOT NULL DEFAULT 'pending',reason TEXT DEFAULT '')""")
-    c.commit()
-    return c
-def clean(x):
-    if pd.isna(x):return ""
-    return str(x).strip()
-def address_parts(a):
-    p=[x.strip() for x in str(a).split(".")]
-    return (p[2],p[3],p[4]) if len(p)>=5 else ("","","")
-def normalize(rows):
-    output=[]
-    for r in rows:
-        sku=clean(r.get("Код SKU") or r.get("Код товара") or r.get("SKU"))
-        bc=clean(r.get("Штрих Код") or r.get("Штрихкод") or r.get("ШК") or r.get("Barcode"))
-        name=clean(r.get("Наименование SKU") or r.get("Наименование") or r.get("Название товара"))
-        a=clean(r.get("Адрес") or r.get("Адрес хранения") or r.get("Адрес ячейки"))
-        if not name or not a: continue
-        alley,module,shelf=address_parts(a)
-        if not alley or not module:continue
-        qty=clean(r.get("Доступный остаток") or r.get("Остаток") or r.get("Количество"))
-        fields=(sku,bc,name,clean(r.get("Единица измерения")),qty,clean(r.get("Группа")),clean(r.get("Подгруппа")),clean(r.get("Торговая марка")),a,alley,module,shelf)
-        # Unique item at a physical address; duplicate rows of same SKU/address become one task
-        key=hashlib.sha256((sku+"|"+a+"|"+bc).encode()).hexdigest()[:24]
-        output.append((key,)+fields)
-    return list({r[0]:r for r in output}.values())
-def import_rows(rows):
-    parsed=normalize(rows)
-    if not parsed: raise ValueError("Не найдены товары с адресами вида 8031.1.8.5.2")
-    c=connect()
-    with c:
-        c.execute("CREATE TEMP TABLE new_products AS SELECT * FROM products WHERE 0")
-        c.executemany("INSERT OR REPLACE INTO new_products VALUES ("+",".join(["?"]*13)+")",parsed)
-        c.execute("DELETE FROM products")
-        c.execute("INSERT INTO products SELECT * FROM new_products")
-        c.execute("DROP TABLE new_products")
-        c.execute("DELETE FROM statuses WHERE item_id NOT IN (SELECT item_id FROM products)")
-    c.close()
-    return len(parsed)
-def read_df():
-    c=connect()
-    df=pd.read_sql_query("""SELECT p.*, COALESCE(s.status,'pending') AS status,
-      COALESCE(s.reason,'') AS reason FROM products p LEFT JOIN statuses s ON p.item_id=s.item_id""",c)
-    c.close()
-    return df
-def set_status(item_id,status,reason=""):
-    c=connect()
-    with c:c.execute("INSERT INTO statuses(item_id,status,reason) VALUES (?,?,?) ON CONFLICT(item_id) DO UPDATE SET status=excluded.status,reason=excluded.reason",(item_id,status,reason))
-    c.close()
-def secret():
-    try: return str(st.secrets["ADMIN_PASSWORD"])
-    except Exception: return os.environ.get("ADMIN_PASSWORD","")
-if "role" not in st.session_state:st.session_state.role="Сотрудник"
-if "admin_ok" not in st.session_state:st.session_state.admin_ok=False
-st.title("📦 Мезонин · выкладка товара")
-role=st.radio("Режим",["Сотрудник","Администратор"],horizontal=True,key="role")
-if role=="Администратор" and not st.session_state.admin_ok:
-    password=st.text_input("Пароль администратора",type="password")
-    if st.button("Войти"):
-        if not secret():st.error("Сначала установите ADMIN_PASSWORD в настройках Streamlit.")
-        elif hmac.compare_digest(password,secret()):st.session_state.admin_ok=True;st.rerun()
-        else:st.error("Неверный пароль")
-    st.stop()
-if role=="Администратор" and st.button("Выйти из кабинета"):
-    st.session_state.admin_ok=False;st.session_state.role="Сотрудник";st.rerun()
-c=connect()
-n=c.execute("SELECT COUNT(*) FROM products").fetchone()[0]
-c.close()
-if not n:
-    with open(ROOT/"demo_items.json",encoding="utf-8") as f: n=import_rows(json.load(f))
-df=read_df()
-if role=="Администратор":
-    st.subheader("Панель руководителя")
-    st.caption("Отчёт автоматически обновляется каждые 5 секунд, пока вкладка открыта")
+st.title('📦 Мезонин')
+st.caption('Выкладка ассортимента по аллеям и модулям')
+with st.expander('📄 Загрузить Excel', expanded='data' not in st.session_state):
+    upload=st.file_uploader('Файл Excel с ассортиментом',type=['xlsx','xls'])
+    st.caption('Статусы в этой версии сохраняются только в текущей сессии. Для общей работы сотрудников потребуется база данных.')
 
-    @st.fragment(run_every="5s")
-    def live_admin_report():
-        latest=read_df()
-        total=len(latest)
-        done=int((latest.status=="done").sum())
-        missing=int((latest.status=="missing").sum())
-        pending=total-done-missing
-        a,b,c,d=st.columns(4)
-        a.metric("Всего адресных позиций",total)
-        b.metric("Выставлено",done)
-        c.metric("Не выставлено",pending)
-        d.metric("Не найдено",missing)
-        st.progress(done/max(total,1),text=f"Прогресс: {done/max(total,1):.1%}")
-        if total:
-            group=latest.groupby("alley",sort=True).agg(
-                total=("item_id","count"),
-                done=("status",lambda s:(s=="done").sum()),
-                missing=("status",lambda s:(s=="missing").sum())
-            ).reset_index()
-            group["pending"]=group.total-group.done-group.missing
-            group["progress_pct"]=(100*group.done/group.total).round(1)
-            st.dataframe(group.rename(columns={
-                "alley":"Аллея","total":"Всего","done":"Выставлено",
-                "missing":"Не найдено","pending":"Не выставлено",
-                "progress_pct":"Прогресс, %"
-            }),hide_index=True,use_container_width=True)
-            st.subheader("Прогресс по модулям")
-            by_module=latest.groupby(["alley","module"],sort=True).agg(
-                total=("item_id","count"),
-                done=("status",lambda s:(s=="done").sum()),
-                missing=("status",lambda s:(s=="missing").sum())
-            ).reset_index()
-            by_module["pending"]=by_module.total-by_module.done-by_module.missing
-            by_module["progress_pct"]=(100*by_module.done/by_module.total).round(1)
-            st.dataframe(by_module.rename(columns={
-                "alley":"Аллея","module":"Модуль","total":"Всего",
-                "done":"Выставлено","missing":"Не найдено",
-                "pending":"Не выставлено","progress_pct":"Прогресс, %"
-            }),hide_index=True,use_container_width=True)
-        st.subheader("Проблемные товары")
-        problems=latest[latest.status=="missing"][["alley","module","shelf","sku","name","address","reason"]]
-        st.dataframe(problems.rename(columns={"alley":"Аллея","module":"Модуль","shelf":"Полка","sku":"Код товара","name":"Товар","address":"Адрес","reason":"Причина"}),hide_index=True,use_container_width=True)
-    live_admin_report()
-    st.divider()
-    st.subheader("Заменить ассортимент из Excel")
-    up=st.file_uploader("Файл .xlsx (доступно только администратору)",type=["xlsx"])
-    if up is not None and st.button("Подтвердить замену базы",type="primary"):
-        try:
-            newdf=pd.read_excel(BytesIO(up.getvalue()),dtype=str,keep_default_na=False,engine="openpyxl")
-            if not any(k in newdf.columns for k in ("Код SKU","Код товара","SKU")):raise ValueError("Нет столбца «Код товара» / «Код SKU»")
-            count=import_rows(newdf.to_dict("records"))
-            st.success(f"Загружено {count} адресных позиций. Совпадающие отметки сохранены.")
-            st.rerun()
-        except Exception as e:st.error(f"Не удалось загрузить файл: {e}")
-    st.caption("ТЕСТ: SQLite хранит отметки в текущем экземпляре сервера. На Streamlit Cloud данные могут исчезнуть после перезапуска. Для постоянной работы подключим общую облачную базу.")
-    st.stop()
+aliases={
+ 'name':['наименование','название товара','товар','наименование товара'],
+ 'code':['код товара','кодтовара','код','sku'],
+ 'barcode':['штрихкод','штрих код','шк','barcode','ean'],
+ 'address':['адрес','адрес хранения','адрес товара'],
+ 'stock':['доступный остаток','остаток','количество','кол-во'],
+ 'unit':['единица измерения','ед. изм.','ед изм','единица','ед.изм'],
+ 'group':['группа товара','группа'],
+ 'subgroup':['подгруппа товара','подгруппа']}
+def norm(s):return re.sub(r'\s+',' ',str(s).strip().lower().replace('_',' '))
+def find_col(cols, opts):
+    for o in opts:
+        for c in cols:
+            if norm(c)==o:return c
+    for o in opts:
+        for c in cols:
+            if o in norm(c):return c
+    return None
+def clean(v):
+    if pd.isna(v):return ''
+    s=str(v).strip()
+    return s[:-2] if re.fullmatch(r'\d+\.0',s) else s
+def addr_parts(a):
+    a=clean(a)
+    p=a.split('.')
+    return (p[2],p[3],p[4]) if len(p)>=5 else ('','','')
 
-st.caption("Рабочий кабинет сотрудника · демонстрационная база из прежней сборки")
-alleys=sorted(df.alley.unique(),key=lambda x:int(x) if x.isdigit() else 999)
-alley=st.selectbox("1. Аллея",alleys,index=alleys.index("8") if "8" in alleys else 0)
-d1=df[df.alley==alley]
-modules=sorted(d1.module.unique(),key=lambda x:int(x) if x.isdigit() else 999)
-module=st.selectbox("2. Модуль",modules)
-d2=d1[d1.module==module]
-shelves=sorted(d2.shelf.unique(),key=lambda x:int(x) if x.isdigit() else 999)
-shelf=st.selectbox("3. Полка",["Все полки"]+shelves)
-view=d2 if shelf=="Все полки" else d2[d2.shelf==shelf]
-total=len(d2);done=int((d2.status=="done").sum());missing=int((d2.status=="missing").sum())
-a,b,c=st.columns(3)
-a.metric("Всего",total);b.metric("Выставлено",done);c.metric("Осталось",total-done-missing)
-st.progress(done/max(total,1),text="Модуль завершён ✅" if done==total and total else f"Модуль: {done}/{total}")
-if missing:st.warning(f"Не найдено: {missing} — модуль ещё не завершён")
-filter_mode=st.segmented_control("Фильтр",["Все","Не выставлено","Выставлено","Не найдено"],default="Не выставлено")
-if filter_mode=="Не выставлено":view=view[view.status=="pending"]
-elif filter_mode=="Выставлено":view=view[view.status=="done"]
-elif filter_mode=="Не найдено":view=view[view.status=="missing"]
-query=st.text_input("Поиск по Barcode, коду или названию",placeholder="Введите или сканируйте штрихкод")
-with st.expander("📷 Открыть сканер Barcode"):
+if upload is not None:
     try:
-        scanner=components.declare_component("mezonin_barcode_scanner",path=str(ROOT/"scanner"))
-        scanned=scanner(key="barcode_scanner",default="")
-        if scanned and scanned!=st.session_state.get("last_scan",""):
-            st.session_state.last_scan=scanned
-            st.session_state.scanned_query=scanned
-            st.rerun()
-    except Exception as e:st.info(f"Сканер недоступен: {e}. Используйте ручной ввод.")
-if st.session_state.get("scanned_query"):
-    st.info(f"Последний скан: {st.session_state.scanned_query}")
-    if st.button("Показать сканированный товар"):
-        st.session_state["search_override"]=st.session_state.scanned_query
-search=query.strip() or st.session_state.get("search_override","")
-if search:
-    view=d1[d1.apply(lambda r:search.lower() in (r["barcode"]+" "+r["sku"]+" "+r["name"]).lower(),axis=1)]
-    st.caption("Поиск выполняется по всей выбранной аллее")
-st.caption(f"Показано позиций: {len(view)}")
-for r in view.head(120).itertuples():
-    with st.container(border=True):
-        left,right=st.columns([1,3])
-        with left:
-            sku_photo=re.sub(r"\.0$","",str(r.sku).strip())
-            if sku_photo and re.fullmatch(r"[0-9A-Za-z_-]+",sku_photo):
-                photo_url=f"https://s3-pic.e-magnum.kz/item/{sku_photo}.jpg"
-                # Browser loads image directly. Streamlit's server-side image fetch is avoided.
-                st.markdown(
-                    f'<div style="min-height:105px;text-align:center">'
-                    f'<img src="{html.escape(photo_url,quote=True)}" loading="eager" referrerpolicy="no-referrer" '
-                    f'style="width:100%;max-width:160px;max-height:165px;object-fit:contain" '
-                    f'onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'block\'">'
-                    f'<div style="display:none;color:#64748b;font-size:12px;padding:24px 0">Фото отсутствует</div>'
-                    f'</div>',unsafe_allow_html=True)
-                st.markdown(f"[Открыть фото ↗]({photo_url})")
-            else:st.caption("Фото отсутствует")
-        with right:
-            st.markdown(f"**{r.name}**")
-            st.caption(f"Код: {r.sku} · ШК: {r.barcode} · Адрес: {r.address}")
-            st.caption(f"Полка {r.shelf} · {r.grp} / {r.subgroup} · Остаток {r.qty} {r.unit}")
-            if r.status=="done":st.success("Выставлен")
-            elif r.status=="missing":st.error("Не найден: "+r.reason)
-            else:st.warning("Не выставлен")
-            b1,b2,b3=st.columns(3)
-            if b1.button("✓ Выставлен",key="done"+r.item_id):set_status(r.item_id,"done");st.rerun()
-            if b2.button("↩ Сбросить",key="reset"+r.item_id):set_status(r.item_id,"pending");st.rerun()
-            reason=b3.selectbox("Причина",["Нет на паллете","Не найден на складе","Проблема с адресом"],key="reason"+r.item_id,label_visibility="collapsed")
-            if st.button("⚠ Товар не найден",key="missing"+r.item_id):set_status(r.item_id,"missing",reason);st.rerun()
-if len(view)>120:st.info("Показаны первые 120 позиций. Выберите полку или используйте поиск.")
+        data=pd.read_excel(upload,dtype=str)
+        st.session_state['data']=data
+        st.session_state['file_name']=upload.name
+    except Exception as e:st.error(f'Не удалось прочитать Excel: {e}')
+
+if 'data' not in st.session_state:
+    st.info('Загрузите Excel, чтобы выбрать аллею и модуль и начать выкладку.')
+    st.stop()
+
+df=st.session_state['data'].copy().fillna('')
+cols={k:find_col(df.columns,v) for k,v in aliases.items()}
+if not cols['address'] or not cols['name']:
+    st.error('Не найдены обязательные столбцы «Адрес» и «Наименование». Проверьте заголовки Excel.')
+    st.write('Найденные столбцы:',', '.join(map(str,df.columns)))
+    st.stop()
+for key,col in cols.items():df[key]=df[col].map(clean) if col else ''
+df[['alley','module','shelf']]=pd.DataFrame(df['address'].map(addr_parts).tolist(),index=df.index)
+df=df[(df.alley!='')&(df.module!='')].copy()
+if df.empty:st.warning('Нет адресов формата 8031.1.8.5.2');st.stop()
+
+def sortkey(s):return (0,int(s)) if str(s).isdigit() else (1,str(s))
+alleys=sorted(df.alley.unique(),key=sortkey)
+c1,c2=st.columns(2)
+with c1:alley=st.selectbox('Аллея',alleys,format_func=lambda x:f'Аллея {x}')
+mods=sorted(df.loc[df.alley==alley,'module'].unique(),key=sortkey)
+with c2:module=st.selectbox('Модуль',mods,format_func=lambda x:f'Модуль {x}')
+part=df[(df.alley==alley)&(df.module==module)].copy()
+# Each address+barcode+code is a distinct placement, including products with two addresses.
+part['item_key']=part.apply(lambda r:'|'.join([r['address'],r['code'],r['barcode'],r['name']]),axis=1)
+part=part.drop_duplicates('item_key')
+if 'statuses' not in st.session_state:st.session_state.statuses={}
+statuses=st.session_state.statuses
+completed=sum(statuses.get(k)=='done' for k in part.item_key)
+total=len(part)
+st.progress(completed/total if total else 0,text=f'Выставлено: {completed} из {total} SKU ({completed/total:.0%})' if total else 'Нет товаров')
+if total and completed==total:st.success('✅ Модуль полностью завершён!')
+filter_mode=st.segmented_control('Показать', ['Все','Не выставлено','Выставлено','Не найдено'],default='Не выставлено')
+show=part.copy()
+if filter_mode=='Не выставлено':show=show[show.item_key.map(lambda k:statuses.get(k)!='done')]
+elif filter_mode=='Выставлено':show=show[show.item_key.map(lambda k:statuses.get(k)=='done')]
+elif filter_mode=='Не найдено':show=show[show.item_key.map(lambda k:statuses.get(k)=='missing')]
+st.caption(f'Показано позиций: {len(show)}')
+for shelf,shelf_df in show.groupby('shelf',sort=False):
+    st.subheader(f'Полка {shelf}')
+    for _,r in shelf_df.iterrows():
+        key=r.item_key
+        with st.container(border=True):
+            piccol,infocol=st.columns([1,2.1],vertical_alignment='top')
+            with piccol:
+                if r['code']:
+                    url=f"https://s3-pic.e-magnum.kz/item/{quote(r['code'])}.jpg"
+                    st.image(url,use_container_width=True)
+                    st.link_button('Фото ↗',url,use_container_width=True)
+                else:st.caption('Нет кода для фото')
+            with infocol:
+                st.markdown(f"**{r['name']}**")
+                st.caption(f"Код: {r['code'] or '—'}  ·  ШК: {r['barcode'] or '—'}")
+                state=statuses.get(key,'none')
+                st.caption({'done':'🟢 Выставлен','missing':'🔴 Не найден','none':'🟡 Не выставлен'}[state])
+            a,b,c=st.columns(3)
+            a.metric('Аллея',r['alley']);b.metric('Модуль',r['module']);c.metric('Полка',r['shelf'])
+            st.write(f"**Остаток:** {r['stock'] or '—'} {r['unit']}")
+            if r['group'] or r['subgroup']:st.caption(' / '.join(x for x in [r['group'],r['subgroup']] if x))
+            x,y=st.columns(2)
+            if x.button('✓ Выставлен',key=f'd_{key}',use_container_width=True,type='primary'):
+                statuses[key]='done';st.rerun()
+            if y.button('✕ Не найден',key=f'm_{key}',use_container_width=True):
+                statuses[key]='missing';st.rerun()
+            if statuses.get(key) in ('done','missing'):
+                if st.button('↩ Сбросить статус',key=f'r_{key}'):
+                    statuses.pop(key,None);st.rerun()
+            if statuses.get(key)=='missing':
+                reasons=['Нет на паллете','Не найден на складе','Другое']
+                st.selectbox('Причина',reasons,key=f'reason_{key}')
+
+with st.expander('📊 Прогресс по аллеям (на этом устройстве)'):
+    stats=[]
+    for a,g in df.groupby('alley'):
+        keys=g.apply(lambda r:'|'.join([r['address'],r['code'],r['barcode'],r['name']]),axis=1).unique()
+        stats.append({'Аллея':a,'Всего SKU':len(keys),'Выставлено':sum(statuses.get(k)=='done' for k in keys),'Не найдено':sum(statuses.get(k)=='missing' for k in keys)})
+    st.dataframe(pd.DataFrame(stats).sort_values('Аллея'),hide_index=True,use_container_width=True)
+    st.download_button('Скачать отчёт CSV',pd.DataFrame(stats).to_csv(index=False).encode('utf-8-sig'),'progress.csv','text/csv')
