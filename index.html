@@ -1,0 +1,42 @@
+<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{font:14px system-ui;margin:0;color:#172033}button{background:#1769e0;color:white;border:0;border-radius:10px;padding:12px 18px;font-weight:700}video{width:100%;max-height:230px;background:#0e1726;border-radius:12px;object-fit:cover}.hint{color:#64748b;font-size:12px;padding-top:6px}.row{display:flex;gap:8px;align-items:center}</style></head><body>
+<div class="row"><button id="toggle">Включить камеру</button><button id="torch" hidden>Фонарик</button></div>
+<video id="video" autoplay muted playsinline></video><div class="hint" id="status">Разрешите доступ к камере. Если камера недоступна, используйте ручной ввод выше.</div>
+<script>
+const video=document.getElementById('video'),status=document.getElementById('status'),btn=document.getElementById('toggle'),torch=document.getElementById('torch');
+let stream=null,active=false,last='',lastTime=0,detector=null,track=null,torchOn=false;
+function emit(v){window.parent.postMessage({isStreamlitMessage:true,type:'streamlit:setComponentValue',value:v},'*');}
+function height(){window.parent.postMessage({isStreamlitMessage:true,type:'streamlit:setFrameHeight',height:330},'*');}
+height();
+window.parent.postMessage({isStreamlitMessage:true,type:'streamlit:componentReady',apiVersion:1},'*');
+async function start(){
+ try{
+  if(!navigator.mediaDevices?.getUserMedia){throw new Error('Для камеры требуется HTTPS или localhost');}
+  if(!('BarcodeDetector' in window)){throw new Error('Этот браузер не поддерживает BarcodeDetector. Используйте ручной ввод или Chrome на Android.');}
+  detector=new BarcodeDetector({formats:['ean_13','ean_8','code_128','upc_a','upc_e','itf','code_39']});
+  stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1280}}});
+  video.srcObject=stream;await video.play();track=stream.getVideoTracks()[0];active=true;btn.textContent='Остановить';status.textContent='Наведите камеру на штрихкод';
+  if(track.getCapabilities?.().torch)torch.hidden=false;
+  scan();
+ }catch(e){status.textContent='Камера: '+e.message;}
+}
+async function scan(){
+ if(!active)return;
+ try{
+  const codes=await detector.detect(video);
+  if(codes.length){
+   const v=codes[0].rawValue,now=Date.now();
+   if(v && (v!==last || now-lastTime>3500)){
+    last=v;lastTime=now;status.textContent='Найден Barcode: '+v;
+    if(navigator.vibrate)navigator.vibrate(90);
+    emit(v);
+   }
+  }
+ }catch(e){}
+ if(active)setTimeout(scan,180);
+}
+function stop(){active=false;stream?.getTracks().forEach(t=>t.stop());stream=null;video.srcObject=null;btn.textContent='Включить камеру';torch.hidden=true;status.textContent='Камера выключена';}
+btn.onclick=()=>active?stop():start();
+torch.onclick=async()=>{try{torchOn=!torchOn;await track.applyConstraints({advanced:[{torch:torchOn}]});torch.textContent=torchOn?'Выключить фонарик':'Фонарик';}catch(e){status.textContent='Фонарик недоступен';}};
+window.addEventListener('message',e=>{if(e.data?.type==='streamlit:render')height();});
+</script></body></html>
