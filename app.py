@@ -1,5 +1,5 @@
 
-import os, json, sqlite3, hashlib, hmac, re
+import os, json, sqlite3, hashlib, hmac, re, html
 from pathlib import Path
 from io import BytesIO
 import pandas as pd
@@ -90,18 +90,51 @@ if not n:
 df=read_df()
 if role=="Администратор":
     st.subheader("Панель руководителя")
-    if st.button("🔄 Обновить отчёт"):st.rerun()
-    total=len(df);done=int((df.status=="done").sum());missing=int((df.status=="missing").sum())
-    a,b,c,d=st.columns(4)
-    a.metric("Всего адресных позиций",total);b.metric("Выставлено",done);c.metric("Не выставлено",total-done-missing);d.metric("Не найдено",missing)
-    st.progress(done/max(total,1),text=f"Прогресс: {done/max(total,1):.0%}")
-    group=df.groupby("alley",sort=True).agg(total=("item_id","count"),done=("status",lambda s:(s=="done").sum()),missing=("status",lambda s:(s=="missing").sum())).reset_index()
-    group["осталось"]=group.total-group.done-group.missing
-    group["прогресс %"]=(100*group.done/group.total).round(1)
-    st.dataframe(group.rename(columns={"alley":"Аллея","total":"Всего","done":"Выставлено","missing":"Не найдено","осталось":"Осталось"}),hide_index=True,use_container_width=True)
-    st.subheader("Проблемные товары")
-    problems=df[df.status=="missing"][["alley","module","shelf","sku","name","address","reason"]]
-    st.dataframe(problems.rename(columns={"alley":"Аллея","module":"Модуль","shelf":"Полка","sku":"Код товара","name":"Товар","address":"Адрес","reason":"Причина"}),hide_index=True,use_container_width=True)
+    st.caption("Отчёт автоматически обновляется каждые 5 секунд, пока вкладка открыта")
+
+    @st.fragment(run_every="5s")
+    def live_admin_report():
+        latest=read_df()
+        total=len(latest)
+        done=int((latest.status=="done").sum())
+        missing=int((latest.status=="missing").sum())
+        pending=total-done-missing
+        a,b,c,d=st.columns(4)
+        a.metric("Всего адресных позиций",total)
+        b.metric("Выставлено",done)
+        c.metric("Не выставлено",pending)
+        d.metric("Не найдено",missing)
+        st.progress(done/max(total,1),text=f"Прогресс: {done/max(total,1):.1%}")
+        if total:
+            group=latest.groupby("alley",sort=True).agg(
+                total=("item_id","count"),
+                done=("status",lambda s:(s=="done").sum()),
+                missing=("status",lambda s:(s=="missing").sum())
+            ).reset_index()
+            group["pending"]=group.total-group.done-group.missing
+            group["progress_pct"]=(100*group.done/group.total).round(1)
+            st.dataframe(group.rename(columns={
+                "alley":"Аллея","total":"Всего","done":"Выставлено",
+                "missing":"Не найдено","pending":"Не выставлено",
+                "progress_pct":"Прогресс, %"
+            }),hide_index=True,use_container_width=True)
+            st.subheader("Прогресс по модулям")
+            by_module=latest.groupby(["alley","module"],sort=True).agg(
+                total=("item_id","count"),
+                done=("status",lambda s:(s=="done").sum()),
+                missing=("status",lambda s:(s=="missing").sum())
+            ).reset_index()
+            by_module["pending"]=by_module.total-by_module.done-by_module.missing
+            by_module["progress_pct"]=(100*by_module.done/by_module.total).round(1)
+            st.dataframe(by_module.rename(columns={
+                "alley":"Аллея","module":"Модуль","total":"Всего",
+                "done":"Выставлено","missing":"Не найдено",
+                "pending":"Не выставлено","progress_pct":"Прогресс, %"
+            }),hide_index=True,use_container_width=True)
+        st.subheader("Проблемные товары")
+        problems=latest[latest.status=="missing"][["alley","module","shelf","sku","name","address","reason"]]
+        st.dataframe(problems.rename(columns={"alley":"Аллея","module":"Модуль","shelf":"Полка","sku":"Код товара","name":"Товар","address":"Адрес","reason":"Причина"}),hide_index=True,use_container_width=True)
+    live_admin_report()
     st.divider()
     st.subheader("Заменить ассортимент из Excel")
     up=st.file_uploader("Файл .xlsx (доступно только администратору)",type=["xlsx"])
@@ -158,7 +191,18 @@ for r in view.head(120).itertuples():
     with st.container(border=True):
         left,right=st.columns([1,3])
         with left:
-            if r.sku:st.image(f"https://s3-pic.e-magnum.kz/item/{r.sku}.jpg",use_container_width=True)
+            sku_photo=re.sub(r"\.0$","",str(r.sku).strip())
+            if sku_photo and re.fullmatch(r"[0-9A-Za-z_-]+",sku_photo):
+                photo_url=f"https://s3-pic.e-magnum.kz/item/{sku_photo}.jpg"
+                # Browser loads image directly. Streamlit's server-side image fetch is avoided.
+                st.markdown(
+                    f'<div style="min-height:105px;text-align:center">'
+                    f'<img src="{html.escape(photo_url,quote=True)}" loading="eager" referrerpolicy="no-referrer" '
+                    f'style="width:100%;max-width:160px;max-height:165px;object-fit:contain" '
+                    f'onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'block\'">'
+                    f'<div style="display:none;color:#64748b;font-size:12px;padding:24px 0">Фото отсутствует</div>'
+                    f'</div>',unsafe_allow_html=True)
+                st.markdown(f"[Открыть фото ↗]({photo_url})")
             else:st.caption("Фото отсутствует")
         with right:
             st.markdown(f"**{r.name}**")
