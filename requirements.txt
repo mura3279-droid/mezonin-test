@@ -1,4 +1,6 @@
-streamlit>=1.40,<2
-pandas>=2.1
-openpyxl>=3.1
-requests>=2.31
+streamlit>=1.45
+pandas
+openpyxl
+xlrd
+supabase
+streamlit-barcode-scanner
